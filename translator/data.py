@@ -66,6 +66,7 @@ def player_seasons(pg: pd.DataFrame) -> pd.DataFrame:
     tg_poss = pg.groupby(["competition", "season", "game_id", "team"])["possessions"].transform("sum") / 5
     pg["poss"] = pg["possessions"].where(pg["possessions"].notna() & (tg_poss > 0), est * tg_poss.where(tg_poss > 0))
     pg["poss"] = pg["poss"].fillna(pg["seconds"] / 60 * 1.8)          # last resort: ~72 possessions per 40'
+    team_net = team_strength(pg)
     keys = ["competition", "season", "player_id"]
     g = pg.groupby(keys)
     out = g[[c for c in COUNTS if c in pg]].sum()
@@ -82,8 +83,28 @@ def player_seasons(pg: pd.DataFrame) -> pd.DataFrame:
     out["team"] = g["team"].agg(lambda s: s.value_counts().index[0])
     out["team_name"] = g["team_name"].agg(lambda s: s.dropna().value_counts().index[0] if s.notna().any() else None)
     out = out.reset_index()
+    out = out.merge(team_net, on=["competition", "season", "team"], how="left")
     out["fga"] = out["fg2_made"] + out["fg2_missed"] + out["fg3_made"] + out["fg3_missed"]
     out["fta"] = out["ft_made"] + out["ft_missed"]
     out["fg3a"] = out["fg3_made"] + out["fg3_missed"]
     out["fg2a"] = out["fg2_made"] + out["fg2_missed"]
     return out
+
+
+def team_strength(pg: pd.DataFrame) -> pd.DataFrame:
+    """Net rating of every team-season (points scored minus allowed per 100 possessions) and the same
+    value in standard deviations of its league-season (`team_z`). Built from the player rows only, so
+    it also works for box-score-only sources: the opponent's points are the opponent's player points
+    in the same game. Needs a `poss` column (see player_seasons)."""
+    keys = ["competition", "season", "game_id", "team"]
+    tg = pg.groupby(keys).agg(pts=("pts", "sum"), poss=("poss", "sum"), opponent=("opponent", "first")).reset_index()
+    tg["poss"] = tg["poss"] / 5
+    opp = tg[keys + ["pts"]].rename(columns={"team": "opponent", "pts": "pts_against"})
+    tg = tg.merge(opp, on=["competition", "season", "game_id", "opponent"], how="left")
+    tg = tg[tg["pts_against"].notna() & (tg["poss"] > 0)]
+    ts = tg.groupby(["competition", "season", "team"]).agg(margin=("pts", "sum"), against=("pts_against", "sum"),
+                                                           poss=("poss", "sum")).reset_index()
+    ts["team_net"] = (ts["margin"] - ts["against"]) / ts["poss"] * 100
+    g = ts.groupby(["competition", "season"])["team_net"]
+    ts["team_z"] = ((ts["team_net"] - g.transform("mean")) / g.transform("std").replace(0, np.nan)).fillna(0.0)
+    return ts[["competition", "season", "team", "team_net", "team_z"]]

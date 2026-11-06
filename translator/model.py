@@ -59,7 +59,7 @@ def relative(ps: pd.DataFrame, min_poss: float = 150) -> pd.DataFrame:
     for m, (col, _) in RATES.items():
         L = league[col].transform("sum") / league["poss"].transform("sum")
         x = ps[col].clip(lower=0)
-        rel = np.log((x + 0.5) / ps["poss"]) - np.log(L)
+        rel = np.log((x + 0.5) / ps["poss"]) - np.log(L.where(L > 0))   # a stat a league does not record: NaN
         rows.append(_frame(ps, m, rel, 1 / (x + 0.5), x / ps["poss"] * 100, L * 100))
     for m, (made, att, _) in PCTS.items():
         n = ps[att]
@@ -83,6 +83,7 @@ def _frame(ps, m, rel, var, value, league_value):
     return pd.DataFrame({"person": ps["person"].values, "person_name": ps["person_name"].values,
                          "competition": ps["competition"].values, "season": ps["season"].values,
                          "team": ps["team"].values, "poss": ps["poss"].values, "metric": m,
+                         "team_z": ps["team_z"].fillna(0.0).values if "team_z" in ps else 0.0,
                          "value": np.asarray(value), "league_value": np.asarray(league_value),
                          "rel": np.asarray(rel), "var": np.asarray(var)})
 

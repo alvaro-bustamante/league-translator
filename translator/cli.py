@@ -6,6 +6,12 @@
     python -m translator.cli translate --player "Shermadini" --from acb --season 2024 --to euroleague --next-season
     python -m translator.cli pairs --from acb --to euroleague      # the players behind a factor
 
+    # v2: one hierarchical Bayesian model for every competition (league + team strength)
+    python -m translator.cli fit --model bayes                     # numpy Gibbs sampler
+    python -m translator.cli fit --model bayes --backend pymc      # the same model with PyMC (NUTS)
+    python -m translator.cli translate --model bayes --player "Shermadini" --from acb --season 2025 \
+        --to euroleague --team-z 1                                 # to a clearly good EuroLeague team
+
 Output in results/: factors.csv, common_scale.csv, links.csv, league_trends.csv and
 factors_<from>_<to>.png (forest plots). The warehouse folder is found next to this project
 (../hoops-warehouse/data/warehouse) or in HOOPS_WAREHOUSE.
@@ -20,14 +26,16 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import data, identity, model
+from . import bayes, data, identity, model
 
 RESULTS = Path("results")
 CACHE = RESULTS / "_relative.pkl"
+BAYES = RESULTS / "_bayes.pkl"
+VERSION = 2          # cache layout (v2 adds team strength)
 
 
 def prepare(competitions: list[str] | None, first: int | None, last: int | None, refresh: bool = False):
-    key = (tuple(competitions or []), first, last)
+    key = (VERSION, tuple(competitions or []), first, last)
     if CACHE.exists() and not refresh:
         k, ps, rel, links = pickle.loads(CACHE.read_bytes())
         if k == key:
@@ -44,6 +52,8 @@ def prepare(competitions: list[str] | None, first: int | None, last: int | None,
 
 
 def fit(args) -> None:
+    if args.model == "bayes":
+        return fit_bayes(args)
     ps, rel, links = prepare(args.competitions, args.from_season, args.to_season, refresh=True)
     comps = sorted(rel["competition"].unique())
     frames = []
@@ -65,6 +75,60 @@ def fit(args) -> None:
     print(show[["from", "to", "label", "n_same", "n_consecutive", "delta", "se", "factor", "designs_agree_z"]]
           .round(3).to_string(index=False))
     print(f"\nSaved to {RESULTS.resolve()}")
+
+
+def fit_bayes(args) -> None:
+    ps, rel, links = prepare(args.competitions, args.from_season, args.to_season, refresh=True)
+    print(f"Joint model ({args.backend}), {args.draws} draws per metric:")
+    fits = bayes.fit_all(rel, reference=args.reference, backend=args.backend, draws=args.draws, burn=args.burn)
+    scale, pairs, hyp = bayes.tables(fits)
+    scale.to_csv(RESULTS / "bayes_scale.csv", index=False)
+    pairs.to_csv(RESULTS / "bayes_factors.csv", index=False)
+    hyp.to_csv(RESULTS / "bayes_hyper.csv", index=False)
+    for f in fits.values():
+        f.extra.pop("trace", None)                    # keep the file small; the summaries are enough
+    BAYES.write_bytes(pickle.dumps({"key": (VERSION, tuple(args.competitions or []), args.from_season,
+                                            args.to_season), "fits": fits}))
+    ladder(scale, RESULTS / "bayes_scale.png")
+    show = scale[scale["metric"].isin(["pts", "ts_pct", "ast", "tov"])].copy()
+    print(show.pivot(index="competition", columns="metric", values="lambda").round(3).to_string())
+    low = scale[(scale["ess"] < 100)]
+    if len(low):
+        print(f"\nNote: {len(low)} effects with effective sample size < 100; use more --draws for final numbers.")
+    print(f"\nSaved to {RESULTS.resolve()} (bayes_scale.csv, bayes_factors.csv, bayes_hyper.csv, bayes_scale.png)")
+
+
+def ladder(scale: pd.DataFrame, path: Path, metrics=("pts", "ts_pct", "ast", "tov", "orb", "drb")) -> None:
+    """Competition effects of the joint model, one panel per metric (reference = 0)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    metrics = [m for m in metrics if m in set(scale["metric"])]
+    if not metrics:
+        return
+    fig, axes = plt.subplots(1, len(metrics), figsize=(2.6 * len(metrics), 3.6), dpi=160, sharey=True)
+    axes = np.atleast_1d(axes)
+    order = scale[scale["metric"] == metrics[0]].sort_values("lambda")["competition"].tolist()
+    for ax, m in zip(axes, metrics):
+        s = scale[scale["metric"] == m].set_index("competition").reindex(order)
+        y = np.arange(len(order))
+        ax.errorbar(s["lambda"], y, xerr=[s["lambda"] - s["q05"], s["q95"] - s["lambda"]], fmt="D", ms=4,
+                    color="#111827", lw=1.5)
+        ax.axvline(0, color="#9ca3af", lw=1, ls=":")
+        ax.set_title(model.LABELS[m], fontsize=9, loc="left")
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.tick_params(labelsize=8)
+    axes[0].set_yticks(np.arange(len(order)), [data.NAMES.get(c, c) for c in order])
+    fig.supxlabel("value of the same player relative to the league (vs reference; 90% interval)", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def load_bayes() -> dict:
+    if not BAYES.exists():
+        raise SystemExit("Run `python -m translator.cli fit --model bayes` first.")
+    return pickle.loads(BAYES.read_bytes())["fits"]
 
 
 def forest(f: pd.DataFrame, path: Path) -> None:
@@ -104,13 +168,22 @@ def translate(args) -> None:
     if me["person"].nunique() > 1:
         print("Several players match:", ", ".join(sorted(me["person_name"].unique())))
     person = me.sort_values("poss", ascending=False)["person"].iloc[0]
+    name = me.loc[me["person"] == person, "person_name"].iloc[0]
+    if args.model == "bayes":
+        out = bayes.translate(load_bayes(), rel, person, args.season, args.source, args.target, team_z=args.team_z,
+                              next_season=args.next_season, target_season=args.target_season)
+        print(f"\n{name}: {data.NAMES.get(args.source, args.source)} {args.season} → "
+              f"{data.NAMES.get(args.target, args.target)}, team strength {args.team_z:+.1f} SD "
+              f"(joint model, 80% interval)\n")
+        print(out[["label", "in_a", "league_a", "expected_b", "lo80", "hi80", "league_b"]].round(2)
+              .to_string(index=False))
+        return
     if args.next_season:
         f = model.move_factor(rel, args.source, args.target)
     else:
         f = model.factors(rel, args.source, args.target)
     out = model.translate(rel, f, person, args.season, args.source, args.target, args.target_season,
                           next_season=args.next_season)
-    name = me.loc[me["person"] == person, "person_name"].iloc[0]
     print(f"\n{name}: {data.NAMES.get(args.source, args.source)} {args.season} → "
           f"{data.NAMES.get(args.target, args.target)} (80% interval)\n")
     print(out[["label", "in_a", "league_a", "expected_b", "lo80", "hi80", "league_b", "shrinkage"]].round(2)
@@ -140,6 +213,13 @@ def main() -> None:
     ap.add_argument("--season", type=int)
     ap.add_argument("--target-season", type=int)
     ap.add_argument("--metric", default="pts")
+    ap.add_argument("--model", choices=["v1", "bayes"], default="v1",
+                    help="v1: pairwise random effects. bayes: joint hierarchical model with team strength.")
+    ap.add_argument("--backend", choices=["gibbs", "pymc"], default="gibbs")
+    ap.add_argument("--draws", type=int, default=3000)
+    ap.add_argument("--burn", type=int, default=1000)
+    ap.add_argument("--team-z", type=float, default=0.0,
+                    help="bayes translate: strength of the new team in SD of its league (0 = average).")
     ap.add_argument("--next-season", action="store_true",
                     help="translate: project his next season in the target league (a signing), from real moves.")
     args = ap.parse_args()

@@ -9,7 +9,12 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from translator import data, identity, model
+from pathlib import Path
+import pickle
+
+from translator import bayes, data, identity, model
+
+BAYES = Path("results") / "_bayes.pkl"
 
 st.set_page_config(page_title="League Translator", page_icon="🏀", layout="wide")
 T = {"es": {"title": "Traductor de ligas", "from": "Desde", "to": "Hacia", "season": "Temporada", "player": "Jugador",
@@ -50,6 +55,11 @@ def factors(a: str, b: str):
     return model.factors(rel, a, b)
 
 
+@st.cache_resource(show_spinner=False)
+def bayes_fits():
+    return pickle.loads(BAYES.read_bytes())["fits"] if BAYES.exists() else None
+
+
 @st.cache_data(show_spinner=False)
 def move(a: str, b: str):
     _, rel = load()
@@ -88,12 +98,30 @@ if pool.empty:
 who = st.sidebar.selectbox(t["player"], pool["person"], format_func=lambda p: pool.set_index("person").loc[p, "person_name"]
                            + f" ({pool.set_index('person').loc[p, 'team']})")
 
+fits = bayes_fits()
+engine = st.sidebar.radio("Modelo" if es else "Model", ["v1", "bayes"] if fits else ["v1"],
+                          format_func=lambda m: {"v1": "v1 · pares de ligas" if es else "v1 · league pairs",
+                                                 "bayes": "v2 · bayesiano conjunto" if es else "v2 · joint Bayesian"}[m],
+                          help=("v2: un único modelo jerárquico para todas las ligas, que separa el efecto de la liga "
+                                "del de la fuerza del equipo. Se ajusta con `python -m translator.cli fit --model bayes`."
+                                if es else "v2: one hierarchical model for every league, separating the league effect "
+                                "from team strength. Fitted with `python -m translator.cli fit --model bayes`."))
+team_z = 0.0
+if engine == "bayes":
+    team_z = st.sidebar.slider("Fuerza del equipo de destino (DE)" if es else "Strength of the new team (SD)",
+                               -2.0, 2.0, 0.0, 0.5,
+                               help="0 = equipo medio de la liga de destino; +1 = claramente bueno; −1 = de la zona baja."
+                               if es else "0 = average team of the target league; +1 = clearly good; −1 = bottom half.")
 fac = factors(a, b) if mode == "same" else move(a, b)
-out = model.translate(rel, fac, who, season, a, b, next_season=mode == "next")
+if engine == "bayes":
+    out = bayes.translate(fits, rel, who, season, a, b, team_z=team_z, next_season=mode == "next")
+    out["shrinkage"] = np.nan
+else:
+    out = model.translate(rel, fac, who, season, a, b, next_season=mode == "next")
 pname = pool.set_index("person").loc[who, "person_name"]
 target = season if mode == "same" else season + 1
 st.subheader(f"{pname} · {name(a)} {season}-{str(season + 1)[-2:]} → {name(b)} {target}-{str(target + 1)[-2:]}")
-if mode == "next":
+if mode == "next" and engine == "v1":
     nm = int(fac["n_move"].median())
     src = fac["move_source"].iloc[0]
     st.caption((f"Basado en {nm} {'jugadores que se quedaron' if a == b else 'traspasos reales'} "
